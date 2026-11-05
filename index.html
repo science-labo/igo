@@ -984,6 +984,8 @@
       const _ttHashLo = new Uint32Array(TT_SIZE);
       const _ttEval = new Float32Array(TT_SIZE);
       const _ttTurn = new Uint8Array(TT_SIZE);
+      const _killerMove1 = new Int16Array(16).fill(-1);
+      const _killerMove2 = new Int16Array(16).fill(-1);
 
       (function initFastTables() {
         let seed = 0x9e3779b9;
@@ -1473,6 +1475,135 @@
         return _infBufA;
       }
 
+      // Root-Level Dead-Territory & Dead-Group Detector (`computeDeadPocketsAtRoot1D`)
+      // Prevents the AI from EVER placing stones inside sealed/dead opponent territories (`死んでいる陣地`)
+      // or feeding stones into already-doomed groups (`死に石への手入れ禁止`, e.g., B1-F1, A4-D4, O18-S19)!
+      const _pocketIdBuf = new Int16Array(TOTAL_CELLS);
+      const _wallFlagBuf = new Uint8Array(TOTAL_CELLS);
+
+      function computeDeadPocketsAtRoot1D(b1d, color, chains, chainIdOf, inf) {
+        const opp = color === BLACK ? WHITE : BLACK;
+        const colorSign = color === BLACK ? 1 : -1;
+        const isDeadTerritory = new Uint8Array(TOTAL_CELLS);
+        const pocketEmpty = new Int16Array(TOTAL_CELLS);
+
+        // Opponent stones with >= 3 liberties act as solid pocket walls, plus tight Kosumi/Tiger's-mouth gaps between them
+        for (let idx = 0; idx < TOTAL_CELLS; idx++) {
+          const v = b1d[idx];
+          if (v === opp) {
+            const ch = chains[chainIdOf[idx]];
+            _wallFlagBuf[idx] = (ch.libs >= 3 || (ch.libs === 2 && ch.size >= 4)) ? 1 : 0;
+          } else if (v === EMPTY) {
+            const orth = ORTH_TABLE[idx];
+            let strongOpp = 0, ownCnt = 0;
+            for (let i = 0; i < orth.length; i++) {
+              const nb = orth[i];
+              if (b1d[nb] === opp && chains[chainIdOf[nb]].libs >= 3) strongOpp++;
+              else if (b1d[nb] === color) ownCnt++;
+            }
+            _wallFlagBuf[idx] = (ownCnt === 0 && strongOpp >= 2 && inf[idx] * colorSign <= -5.0) ? 1 : 0;
+          } else {
+            _wallFlagBuf[idx] = 0;
+          }
+        }
+
+        _pocketIdBuf.fill(-1);
+        let pid = 0;
+        for (let startIdx = 0; startIdx < TOTAL_CELLS; startIdx++) {
+          if (_wallFlagBuf[startIdx] === 1 || _pocketIdBuf[startIdx] !== -1) continue;
+          let qH = 0, qT = 0;
+          _bfsQueue[qT++] = startIdx;
+          _pocketIdBuf[startIdx] = pid;
+
+          let empCnt = 0;
+          let ownStones = 0;
+          let friendlyCells = 0;
+          let maxEyes = 0;
+          let maxLibs = 0;
+
+          while (qH < qT) {
+            const cur = _bfsQueue[qH++];
+            const cv = b1d[cur];
+            if (cv === EMPTY) {
+              empCnt++;
+              if (inf[cur] * colorSign >= 1.0) friendlyCells++;
+            } else if (cv === color) {
+              ownStones++;
+              const cid = chainIdOf[cur];
+              if (cid !== -1) {
+                if (chains[cid].eyeCount > maxEyes) maxEyes = chains[cid].eyeCount;
+                if (chains[cid].libs > maxLibs) maxLibs = chains[cid].libs;
+              }
+            }
+            const orth = ORTH_TABLE[cur];
+            for (let i = 0; i < orth.length; i++) {
+              const nb = orth[i];
+              if (_wallFlagBuf[nb] === 0 && _pocketIdBuf[nb] === -1) {
+                _pocketIdBuf[nb] = pid;
+                _bfsQueue[qT++] = nb;
+              }
+            }
+          }
+
+          let isDead = 0;
+          if (maxEyes < 1.8) {
+            if (ownStones === 0 && empCnt <= 15 && friendlyCells === 0) {
+              isDead = 1; // Sealed empty opponent territory!
+            } else if (ownStones > 0 && empCnt <= 8 && friendlyCells === 0 && maxLibs <= 3) {
+              isDead = 1; // Trapped own stones inside sealed opponent territory with no room to live!
+            }
+          }
+
+          for (let k = 0; k < qT; k++) {
+            const cell = _bfsQueue[k];
+            pocketEmpty[cell] = empCnt;
+            if (isDead) isDeadTerritory[cell] = 1;
+          }
+          pid++;
+        }
+
+        for (let idx = 0; idx < TOTAL_CELLS; idx++) {
+          if (b1d[idx] === EMPTY && _wallFlagBuf[idx] === 1 && inf[idx] * colorSign <= -5.0) {
+            isDeadTerritory[idx] = 1;
+          }
+        }
+
+        for (let i = 0; i < chains.length; i++) {
+          const ch = chains[i];
+          if (ch.color === color) {
+            const s0 = ch.stones[0];
+            let allLibsDeepEnemy = true;
+            for (let k = 0; k < ch.libSet.length; k++) {
+              if (inf[ch.libSet[k]] * colorSign > -3.0) {
+                allLibsDeepEnemy = false;
+                break;
+              }
+            }
+            let minAdjOppL = 99;
+            for (let a = 0; a < ch.adjOppIds.length; a++) {
+              const ol = chains[ch.adjOppIds[a]].libs;
+              if (ol < minAdjOppL) minAdjOppL = ol;
+            }
+            // Check if `ch` is trapped inside a tiny sealed pocket (`pocketEmpty[s0] <= 7`) AND no liberty move reaches >= 4 liberties!
+            let canBreakOut = false;
+            if (ch.libs <= 3 && (isDeadTerritory[s0] === 1 || (allLibsDeepEnemy && pocketEmpty[s0] <= 8 && minAdjOppL >= 3))) {
+              for (let k = 0; k < ch.libSet.length; k++) {
+                const testSim = simulateMove1D(b1d, ch.libSet[k], color, -1);
+                if (testSim && (testSim.capturedCount > 0 || testSim.ownLibs >= 4 || (testSim.ownLibs === 3 && pocketEmpty[s0] > 6))) {
+                  canBreakOut = true;
+                  break;
+                }
+              }
+              ch.isDeadInPocket = !canBreakOut;
+            } else {
+              ch.isDeadInPocket = false;
+            }
+          }
+        }
+
+        return { isDeadTerritory, pocketEmpty };
+      }
+
       // True Japanese-Rule Static Board Evaluation Function with Zobrist TT Caching & 2nd-Order Liberty Life/Death
       function evaluateBoard1D(b1d, aiColor, netCapturesByAI, nextTurnColor) {
         const zob = computeZobrist1D(b1d);
@@ -1703,7 +1834,7 @@
         const { chains, chainIdOf } = analyzeChains1D(b1d);
         const ladderDepth = level >= 13 ? 8 : (level >= 9 ? 6 : (level >= 6 ? 4 : 2));
 
-        const infMap = (mode < 2 && level >= 5) ? new Float32Array(computeInfluence1D(b1d)) : null;
+        const infMap = (mode === 0 && level >= 5) ? new Float32Array(computeInfluence1D(b1d)) : null;
         const colorSign = color === BLACK ? 1 : -1;
 
         // Compute `secureLibs` for each chain using `infMap` so we know which chains have a living territory base vs floating!
@@ -1720,6 +1851,8 @@
           ch.isAlive = (sec >= 3) || (ch.eyeCount >= 1.8) || (ch.libs >= 5);
         }
 
+        const deadPocketInfo = (infMap && level >= 6) ? computeDeadPocketsAtRoot1D(b1d, color, chains, chainIdOf, infMap) : null;
+
         const save1LibMap = new Map();
         const save2LibMap = new Map();
         const dragonEscapeLibMap = new Map();
@@ -1734,6 +1867,18 @@
           const kMult = ch.isKaname ? 1.5 : 1.0;
 
           if (ch.color === color) {
+            if (ch.isDeadInPocket) {
+              ch.adjOppIds.forEach(oppId => {
+                const og = chains[oppId];
+                if (og.libs === 1) {
+                  og.libSet.forEach(olk => {
+                    provenKillMoveMap.set(olk, Math.max(provenKillMoveMap.get(olk) || 0, 270 + (ch.size + og.size) * 70));
+                    tacticalSet.add(olk);
+                  });
+                }
+              });
+              continue;
+            }
             if (ch.libs === 1) {
               ch.libSet.forEach(lk => {
                 save1LibMap.set(lk, (save1LibMap.get(lk) || 0) + ch.size * kMult);
@@ -2173,6 +2318,35 @@
               }
             }
 
+            // Dual-Purpose Sente Move (攻防一体の急所: rescues our weak group while pressuring opponent group to <= 2 libs!)
+            if (minAdjOwnLibsBefore <= 3 && sim.ownLibs >= 4 && minAdjOppLibsAfter <= 2) {
+              score += 65;
+            }
+
+            // 1-Space Jump Split & Peep Defense (一間トビのノゾキ受け・相手のトビの分断)
+            if (r >= 1 && r <= 17) {
+              const upIdx = (r - 1) * BOARD_SIZE + c;
+              const dnIdx = (r + 1) * BOARD_SIZE + c;
+              if (b1d[upIdx] === color && b1d[dnIdx] === color && chainIdOf[upIdx] !== chainIdOf[dnIdx] && orthOppCount >= 1) {
+                if (Math.min(chains[chainIdOf[upIdx]].libs, chains[chainIdOf[dnIdx]].libs) <= 4) {
+                  score += 88; // Connect our 1-space jump when peeped!
+                }
+              } else if (b1d[upIdx] === opp && b1d[dnIdx] === opp && chainIdOf[upIdx] !== chainIdOf[dnIdx] && sim.ownLibs >= 3) {
+                score += 72; // Split opponent's 1-space jump!
+              }
+            }
+            if (c >= 1 && c <= 17) {
+              const lfIdx = r * BOARD_SIZE + (c - 1);
+              const rtIdx = r * BOARD_SIZE + (c + 1);
+              if (b1d[lfIdx] === color && b1d[rtIdx] === color && chainIdOf[lfIdx] !== chainIdOf[rtIdx] && orthOppCount >= 1) {
+                if (Math.min(chains[chainIdOf[lfIdx]].libs, chains[chainIdOf[rtIdx]].libs) <= 4) {
+                  score += 88; // Connect our 1-space jump when peeped!
+                }
+              } else if (b1d[lfIdx] === opp && b1d[rtIdx] === opp && chainIdOf[lfIdx] !== chainIdOf[rtIdx] && sim.ownLibs >= 3) {
+                score += 72; // Split opponent's 1-space jump!
+              }
+            }
+
             if (sim.capturedCount === 0 && !save1LibMap.has(idx)) {
               score -= evaluateBadShape1D(b1d, r, c, color);
             }
@@ -2205,16 +2379,39 @@
             else if (dv === opp) diagOppCount++;
           }
 
-          // 8. Global Big Points (大場・二間ビラキ・ケイマ), 1st/2nd Line Yose Sealing, & Moyo Expansion
+          // 8. Global Big Points (大場・二間ビラキ・ケイマ), Non-Crawling 1st/2nd Line Yose Sealing, & Moyo Expansion
           const minEdge = MIN_EDGE_TABLE[idx];
           if (mode < 2) {
             if (minEdge === 0) {
-              const is1stLineYose = (orthOwnCount >= 1 && (orthOppCount >= 1 || diagOppCount >= 1)) ||
-                                    (orthOppCount >= 1 && diagOwnCount >= 1);
-              if (is1stLineYose && sim.ownLibs >= 2 && stoneCount > 55) {
-                score += (stoneCount > 100 ? 82 : 50);
+              let has2ndLineOwn = false;
+              let has1stLineOwn = false;
+              let has2ndLineOpp = false;
+              for (let i = 0; i < orth.length; i++) {
+                const nb = orth[i];
+                if (b1d[nb] === color) {
+                  if (MIN_EDGE_TABLE[nb] === 1) has2ndLineOwn = true;
+                  else if (MIN_EDGE_TABLE[nb] === 0) has1stLineOwn = true;
+                } else if (b1d[nb] === opp && MIN_EDGE_TABLE[nb] === 1) {
+                  has2ndLineOpp = true;
+                }
+              }
+              for (let i = 0; i < diagList.length; i++) {
+                const nb = diagList[i];
+                if (b1d[nb] === color && MIN_EDGE_TABLE[nb] === 1) has2ndLineOwn = true;
+                else if (b1d[nb] === opp && MIN_EDGE_TABLE[nb] === 1) has2ndLineOpp = true;
+              }
+
+              // Forbid crawling along the 1st line under opponent's 2nd-line wall without 2nd-line friendly support!
+              if (has1stLineOwn && !has2ndLineOwn && has2ndLineOpp && sim.capturedCount === 0) {
+                score -= 145;
               } else {
-                score -= (stoneCount < 130) ? 95 : 40;
+                const is1stLineYose = (orthOwnCount >= 1 && (orthOppCount >= 1 || diagOppCount >= 1)) ||
+                                      (orthOppCount >= 1 && diagOwnCount >= 1);
+                if (is1stLineYose && sim.ownLibs >= 2 && stoneCount > 55) {
+                  score += (stoneCount > 100 ? 82 : 50);
+                } else {
+                  score -= (stoneCount < 130) ? 95 : 40;
+                }
               }
             } else if (minEdge === 1) {
               const is2ndLineYose = (orthOwnCount >= 1 && (orthOppCount >= 1 || diagOppCount >= 1)) ||
@@ -2236,7 +2433,15 @@
                   score += 28;
                 }
               } else if (orthOwnCount === 0 && orthOppCount === 0 && ownNearR2 >= 1 && ownNearR2 <= 2 && oppNearR2 <= 2 && sim.ownLibs === 4) {
-                score += 44;
+                score += 46;
+                // Extra bonus for pure Ikken-Tobi (1-space jump) when opponent stones are not crowding (`oppNearR2 <= 1`)!
+                if (oppNearR2 <= 1 &&
+                    ((r >= 2 && b1d[(r - 2) * BOARD_SIZE + c] === color && b1d[(r - 1) * BOARD_SIZE + c] === EMPTY) ||
+                     (r <= 16 && b1d[(r + 2) * BOARD_SIZE + c] === color && b1d[(r + 1) * BOARD_SIZE + c] === EMPTY) ||
+                     (c >= 2 && b1d[r * BOARD_SIZE + (c - 2)] === color && b1d[r * BOARD_SIZE + (c - 1)] === EMPTY) ||
+                     (c <= 16 && b1d[r * BOARD_SIZE + (c + 2)] === color && b1d[r * BOARD_SIZE + (c + 1)] === EMPTY))) {
+                  score += 14;
+                }
               }
             }
 
@@ -2262,14 +2467,28 @@
               score += grad;
             }
 
-            if (oppNearR2 > 0 && localInf > 3.5 && minAdjOwnLibsBefore <= 4) {
+            // Check 4-direction cardinal escape highways (3 steps Up, Down, Left, Right free of opponent stones)
+            let openCardinalDirs = 0;
+            if (r >= 3 && b1d[(r - 1) * BOARD_SIZE + c] !== opp && b1d[(r - 2) * BOARD_SIZE + c] !== opp && b1d[(r - 3) * BOARD_SIZE + c] !== opp) openCardinalDirs++;
+            if (r <= 15 && b1d[(r + 1) * BOARD_SIZE + c] !== opp && b1d[(r + 2) * BOARD_SIZE + c] !== opp && b1d[(r + 3) * BOARD_SIZE + c] !== opp) openCardinalDirs++;
+            if (c >= 3 && b1d[r * BOARD_SIZE + (c - 1)] !== opp && b1d[r * BOARD_SIZE + (c - 2)] !== opp && b1d[r * BOARD_SIZE + (c - 3)] !== opp) openCardinalDirs++;
+            if (c <= 15 && b1d[r * BOARD_SIZE + (c + 1)] !== opp && b1d[r * BOARD_SIZE + (c + 2)] !== opp && b1d[r * BOARD_SIZE + (c + 3)] !== opp) openCardinalDirs++;
+
+            // A) STRICT DEAD-TERRITORY PROHIBITION (`死んでいる陣地に絶対に石を置かない`):
+            if (sim.capturedCount === 0 && deadPocketInfo && deadPocketInfo.isDeadTerritory[idx] === 1) {
+              score -= 650;
+            } else if (sim.capturedCount === 0 && localInf < -5.0 && ownNearR2 === 0 && (openCardinalDirs <= 1 || minEdge <= 1 || oppNearR2 >= 3)) {
+              // Boxed in on 3+ sides inside opponent territory or on 1st/2nd line with no friendly support: FORBIDDEN!
+              score -= 420;
+            } else if (oppNearR2 > 0 && localInf > 3.5 && localInf <= 7.5 && minAdjOwnLibsBefore <= 4) {
               score += 60 + Math.min(30, localInf * 1.8);
-            } else if (localInf <= -3.5 && localInf >= -24.0 && minEdge >= 2 && oppNearR2 <= 2 && orthOppCount === 0 && sim.ownLibs === 4) {
+            } else if (localInf <= -3.5 && localInf >= -20.0 && minEdge >= 2 && openCardinalDirs >= 2 && oppNearR2 <= 2 && orthOppCount === 0 && sim.ownLibs === 4) {
+              // Invade / Reduce opponent's open moyo ONLY when `openCardinalDirs >= 2` (at least 2 open escape highways!)
               score += 80 + Math.min(34, Math.abs(localInf) * 1.5);
             } else if (Math.abs(localInf) <= 6.5 && orthOwnCount === 0) {
               score += 36 - Math.abs(localInf) * 2.5;
             } else if (localInf > 7.5 && oppNearR2 === 0 && sim.capturedCount === 0) {
-              score -= 125;
+              score -= 135;
             }
           }
 
@@ -2385,6 +2604,26 @@
         const branchWidth = depth >= 2 ? (level >= 14 ? 6 : 5) : 5;
         const topBranch = gen.moves.slice(0, Math.min(branchWidth, gen.moves.length));
 
+        // Killer Move Ordering: If a killer move for this `depth` is in `gen.moves`, pull it to index 0!
+        const k1 = _killerMove1[depth];
+        const k2 = _killerMove2[depth];
+        if (k1 !== -1 || k2 !== -1) {
+          for (let i = 1; i < Math.min(10, gen.moves.length); i++) {
+            const cand = gen.moves[i];
+            if (cand.idx === k1 || cand.idx === k2) {
+              if (i < topBranch.length) {
+                topBranch.splice(i, 1);
+                topBranch.unshift(cand);
+              } else {
+                topBranch[topBranch.length - 1] = cand;
+                const tmp = topBranch.pop();
+                topBranch.unshift(tmp);
+              }
+              break;
+            }
+          }
+        }
+
         if (maximizingPlayer) {
           let maxEval = -Infinity;
           for (let i = 0; i < topBranch.length; i++) {
@@ -2406,7 +2645,13 @@
 
             if (val > maxEval) maxEval = val;
             if (val > alpha) alpha = val;
-            if (beta <= alpha) break;
+            if (beta <= alpha) {
+              if (_killerMove1[depth] !== mv.idx) {
+                _killerMove2[depth] = _killerMove1[depth];
+                _killerMove1[depth] = mv.idx;
+              }
+              break;
+            }
           }
           return maxEval;
         } else {
@@ -2430,7 +2675,13 @@
 
             if (val < minEval) minEval = val;
             if (val < beta) beta = val;
-            if (beta <= alpha) break;
+            if (beta <= alpha) {
+              if (_killerMove1[depth] !== mv.idx) {
+                _killerMove2[depth] = _killerMove1[depth];
+                _killerMove1[depth] = mv.idx;
+              }
+              break;
+            }
           }
           return minEval;
         }
@@ -2478,10 +2729,11 @@
               break;
             }
             const mv = topMoves[i];
+            const rootAlpha = currentBestScore === -Infinity ? -Infinity : (currentBestScore - mv.score * 0.16);
             const searchVal = alphaBeta1D(
               mv.sim.nextB,
               d,
-              alpha,
+              rootAlpha,
               beta,
               false,
               color,
@@ -2507,7 +2759,7 @@
           }
         }
 
-        if (stoneCount > 190 && bestMove.score < -30) {
+        if ((stoneCount > 130 && bestMove.score < 0) || (stoneCount > 170 && bestMove.score < 12)) {
           return null;
         }
         return { r: bestMove.r, c: bestMove.c, score: bestMove.score };
