@@ -37,7 +37,7 @@
 <body class="bg-stone-900 text-stone-100 flex flex-col justify-between h-[100dvh] w-full overflow-hidden">
 
   <!-- Top Compact Header & Player Status Bar -->
-  <header class="w-full bg-stone-950/90 border-b border-stone-800 px-2.5 py-1.5 shrink-0 z-20">
+  <header class="w-full bg-stone-950/90 border-b border-stone-800 px-2.5 pb-1.5 shrink-0 z-20" style="padding-top: max(env(safe-area-inset-top, 0px), 10px);">
     <div class="max-w-xl mx-auto flex items-center justify-between gap-1.5">
       <!-- Title & Rule Badge -->
       <div class="flex items-center gap-1.5 min-w-0">
@@ -748,11 +748,10 @@
       }
 
       // Japanese Territory & Dead-Stone Calculation
-      // Returns territory map (0=neutral/dame, 1=Black territory, 2=White territory)
-      // and full Japanese rule score breakdown.
+      // Combines exact orthogonal flood-fill for sealed regions with Wall-Blocked Wavefront Territory recognition
+      // so diagonal walls (Kosumi) and 2nd-line stones protecting the 1st line are accurately scored as territory!
       function calculateJapaneseTerritory(customDeadMap) {
         const dead = customDeadMap || deadStones;
-        // Create effective board with dead stones removed
         const eff = createEmptyBoard();
         let deadBlackCount = 0;
         let deadWhiteCount = 0;
@@ -770,6 +769,9 @@
           }
         }
 
+        const eff1D = to1DBoard(eff);
+        const waveInf = computeInfluence1D(eff1D);
+
         const territoryMap = createEmptyBoard();
         const visited = new Set();
         let blackTerritory = 0;
@@ -779,7 +781,6 @@
           for (let c = 0; c < BOARD_SIZE; c++) {
             const key = r * BOARD_SIZE + c;
             if (eff[r][c] === EMPTY && !visited.has(key)) {
-              // Flood fill empty region
               const region = [];
               const stack = [[r, c]];
               visited.add(key);
@@ -808,18 +809,29 @@
                 }
               }
 
-              let owner = EMPTY;
               if (touchesBlack && !touchesWhite) {
-                owner = BLACK;
                 blackTerritory += region.length;
-              } else if (touchesWhite && !touchesBlack) {
-                owner = WHITE;
-                whiteTerritory += region.length;
-              }
-
-              if (owner !== EMPTY) {
                 for (let i = 0; i < region.length; i++) {
-                  territoryMap[region[i][0]][region[i][1]] = owner;
+                  territoryMap[region[i][0]][region[i][1]] = BLACK;
+                }
+              } else if (touchesWhite && !touchesBlack) {
+                whiteTerritory += region.length;
+                for (let i = 0; i < region.length; i++) {
+                  territoryMap[region[i][0]][region[i][1]] = WHITE;
+                }
+              } else if (touchesBlack && touchesWhite) {
+                // Region has an unsealed gap (e.g. diagonal Kosumi or 1st-line opening):
+                // Use Wall-Blocked Wavefront Influence to assign intersections clearly enclosed by one side!
+                for (let i = 0; i < region.length; i++) {
+                  const [rr, rc] = region[i];
+                  const infVal = waveInf[rr * BOARD_SIZE + rc];
+                  if (infVal >= 4.8) {
+                    territoryMap[rr][rc] = BLACK;
+                    blackTerritory++;
+                  } else if (infVal <= -4.8) {
+                    territoryMap[rr][rc] = WHITE;
+                    whiteTerritory++;
+                  }
                 }
               }
             }
@@ -843,23 +855,34 @@
         };
       }
 
-      // Auto-suggest clearly dead groups (stones in atari or surrounded inside enemy influence) when entering scoring mode
+      // Smart Dead-Stone Detector: detects groups in Atari, groups caught in 2-lib Ladders/Geta,
+      // and isolated eye-less groups surrounded deep inside enemy territory!
       function autoDetectDeadStones() {
         deadStones = createEmptyBoard();
-        const visited = new Set();
+        const b1d = to1DBoard(board);
+        const { chains } = analyzeChains1D(b1d);
+        const inf = computeInfluence1D(b1d);
 
-        for (let r = 0; r < BOARD_SIZE; r++) {
-          for (let c = 0; c < BOARD_SIZE; c++) {
-            const key = r * BOARD_SIZE + c;
-            if (board[r][c] !== EMPTY && !visited.has(key)) {
-              const grp = getGroupAndLiberties(board, r, c);
-              grp.stones.forEach(([sr, sc]) => visited.add(sr * BOARD_SIZE + sc));
-              // Mark groups in 1-liberty Atari or small isolated groups with <= 2 liberties as dead by default
-              if (grp.liberties <= 1 || (grp.stones.length <= 2 && grp.liberties <= 2)) {
-                grp.stones.forEach(([sr, sc]) => {
-                  deadStones[sr][sc] = 1;
-                });
-              }
+        for (let i = 0; i < chains.length; i++) {
+          const ch = chains[i];
+          let isDead = false;
+          if (ch.libs <= 1) {
+            isDead = true;
+          } else if (ch.libs === 2 && findKillOn2LibGroup1D(b1d, ch.stones[0], -1, 5) !== -1) {
+            isDead = true;
+          } else if (ch.eyeCount < 1.5 && ch.libs <= 3 && ch.size <= 8) {
+            // Check if all liberties are surrounded by strong opponent influence
+            const oppSign = ch.color === BLACK ? -1 : 1;
+            let surroundedLibs = 0;
+            ch.libSet.forEach(lk => {
+              if (inf[lk] * oppSign > 2.5) surroundedLibs++;
+            });
+            if (surroundedLibs === ch.libs) isDead = true;
+          }
+          if (isDead) {
+            for (let k = 0; k < ch.stones.length; k++) {
+              const idx = ch.stones[k];
+              deadStones[ROW_TABLE[idx]][COL_TABLE[idx]] = 1;
             }
           }
         }
@@ -941,7 +964,7 @@
         drawBoard();
       }
 
-      // --- Hyper-Strong 15-Rank Go AI Engine (1D Zero-Alloc Bitboard + Iterative Deepening Alpha-Beta + Quiescence + Dragon/Kaname-ishi + Semeai) ---
+      // --- God-Tier 15-Rank Go AI Engine (Zobrist TT + 2nd-Order Liberty Life/Death + Wavefront Gradient Yose + Deep Alpha-Beta/Quiescence) ---
 
       const TOTAL_CELLS = 361;
       const ORTH_TABLE = new Array(TOTAL_CELLS);
@@ -952,7 +975,31 @@
       const ROW_TABLE = new Uint8Array(TOTAL_CELLS);
       const COL_TABLE = new Uint8Array(TOTAL_CELLS);
 
+      // Zobrist Hashing Tables (32-bit Hi/Lo pairs for collision-free Transposition Table caching)
+      const ZOBRIST_HI = [new Uint32Array(TOTAL_CELLS), new Uint32Array(TOTAL_CELLS), new Uint32Array(TOTAL_CELLS)];
+      const ZOBRIST_LO = [new Uint32Array(TOTAL_CELLS), new Uint32Array(TOTAL_CELLS), new Uint32Array(TOTAL_CELLS)];
+      const TT_SIZE = 32768; // 2^15 entries
+      const TT_MASK = TT_SIZE - 1;
+      const _ttHashHi = new Uint32Array(TT_SIZE);
+      const _ttHashLo = new Uint32Array(TT_SIZE);
+      const _ttEval = new Float32Array(TT_SIZE);
+      const _ttTurn = new Uint8Array(TT_SIZE);
+
       (function initFastTables() {
+        let seed = 0x9e3779b9;
+        function nextRand32() {
+          seed ^= seed << 13;
+          seed ^= seed >>> 17;
+          seed ^= seed << 5;
+          return seed >>> 0;
+        }
+        for (let c = 1; c <= 2; c++) {
+          for (let i = 0; i < TOTAL_CELLS; i++) {
+            ZOBRIST_HI[c][i] = nextRand32();
+            ZOBRIST_LO[c][i] = nextRand32();
+          }
+        }
+
         for (let r = 0; r < BOARD_SIZE; r++) {
           for (let c = 0; c < BOARD_SIZE; c++) {
             const idx = r * BOARD_SIZE + c;
@@ -994,6 +1041,18 @@
           }
         }
       })();
+
+      function computeZobrist1D(b1d) {
+        let hi = 0 >>> 0, lo = 0 >>> 0;
+        for (let i = 0; i < TOTAL_CELLS; i++) {
+          const v = b1d[i];
+          if (v !== EMPTY) {
+            hi = (hi ^ ZOBRIST_HI[v][i]) >>> 0;
+            lo = (lo ^ ZOBRIST_LO[v][i]) >>> 0;
+          }
+        }
+        return { hi, lo };
+      }
 
       // Convert 2D board to fast 1D Uint8Array(361)
       function to1DBoard(b2d) {
@@ -1072,7 +1131,6 @@
           if (nextB[nb] === opp) {
             const info = getChainInfo1D(nextB, nb);
             if (info.libs === 0) {
-              // Remove captured chain using _bfsQueue (which still holds the stones from getChainInfo1D!)
               const sz = info.size;
               capturedCount += sz;
               if (sz === 1) singleCapIdx = nb;
@@ -1106,7 +1164,6 @@
 
       // --- Exact Turn-Aware Tactical Reader (Shicho / Ladder, Geta / Net, Snapback, Oiotoshi, Counter-Atari) ---
 
-      // Helper: Collects all stones of chain at `startIdx` and all adjacent opponent chains that have 1 liberty
       function getChainAndCounterAtaris1D(b1d, startIdx) {
         const color = b1d[startIdx];
         const opp = color === BLACK ? WHITE : BLACK;
@@ -1163,23 +1220,15 @@
 
       // 1. `isDoomedInAtari1D(b1d, targetIdx, maxDepth)`
       // Prerequisite: `targetIdx` currently has 1 liberty on `b1d`, and it is `targetColor`'s turn to try to escape.
-      // Returns TRUE if `targetIdx` CANNOT escape even with best play (doomed in Ladder / Geta / Oiotoshi).
       function isDoomedInAtari1D(b1d, targetIdx, maxDepth) {
         const targetColor = b1d[targetIdx];
         if (targetColor === EMPTY) return true;
         const details = getChainAndCounterAtaris1D(b1d, targetIdx);
         if (details.libs === 0) return true;
         if (details.libs >= 3) return false;
-        if (details.libs === 2) {
-          // If it already has 2 liberties and it's target's turn, target can almost always reach 3 liberties
-          return false;
-        }
+        if (details.libs === 2) return false;
         if (maxDepth <= 0) return false;
 
-        const attacker = targetColor === BLACK ? WHITE : BLACK;
-        // All legal ways targetColor can try to save `targetIdx`:
-        // (a) Play on its single liberty `details.lib0`
-        // (b) Capture an adjacent 1-liberty attacker group (`details.counterCaptureLibs`)
         const escapeMoves = [details.lib0];
         for (let i = 0; i < details.counterCaptureLibs.length; i++) {
           const cc = details.counterCaptureLibs[i];
@@ -1192,27 +1241,18 @@
           if (!defSim) continue;
 
           const afterInfo = getChainInfo1D(defSim.nextB, targetIdx);
-          if (afterInfo.libs >= 3) {
-            return false; // Escaped to 3+ liberties!
-          }
-          if (afterInfo.libs === 1) {
-            // Still 1 liberty after playing (Oiotoshi / self-atari): attacker captures immediately!
-            continue;
-          }
+          if (afterInfo.libs >= 3) return false;
+          if (afterInfo.libs === 1) continue;
           if (afterInfo.libs === 2) {
-            // Now it is Attacker's turn to chase `targetIdx` (which has 2 liberties: l0, l1)
             const killMove = findKillOn2LibGroup1D(defSim.nextB, targetIdx, defSim.nextKo, maxDepth - 1);
-            if (killMove === -1) {
-              return false; // Attacker has no continuation to kill it; target escaped!
-            }
+            if (killMove === -1) return false;
           }
         }
-        return true; // Every escape attempt failed!
+        return true;
       }
 
       // 2. `findKillOn2LibGroup1D(b1d, targetIdx, koIdx, maxDepth)`
       // Prerequisite: `targetIdx` currently has 2 liberties on `b1d`, and it is `attacker`'s turn to move!
-      // Returns the winning attack index (`0..360`) that forcibly kills `targetIdx` via Ladder or Geta, or `-1` if it can escape.
       function findKillOn2LibGroup1D(b1d, targetIdx, koIdx, maxDepth) {
         if (maxDepth <= 0) return -1;
         const targetColor = b1d[targetIdx];
@@ -1224,14 +1264,12 @@
         const l0 = info.lib0;
         const l1 = info.lib1;
 
-        // First test direct Atari on l0 and l1 (Shicho / Ladder / Double-Atari)
         const directLibs = [l0, l1];
         for (let i = 0; i < 2; i++) {
           const atkIdx = directLibs[i];
           const atkSim = simulateMove1D(b1d, atkIdx, attacker, koIdx);
           if (!atkSim) continue;
-          if (atkSim.nextB[targetIdx] === EMPTY) return atkIdx; // Captured immediately!
-          // If our attacking stone itself is in 1-liberty Atari (and didn't capture), target will just capture our stone!
+          if (atkSim.nextB[targetIdx] === EMPTY) return atkIdx;
           if (atkSim.ownLibs <= 1) continue;
 
           const chasedInfo = getChainInfo1D(atkSim.nextB, targetIdx);
@@ -1242,7 +1280,7 @@
           }
         }
 
-        // Next test Geta (Net / ゲタ) diagonal points if l0 and l1 are diagonally adjacent!
+        // Geta (Net / ゲタ) diagonal points if l0 and l1 are diagonally adjacent or share an empty net point
         if (maxDepth >= 2) {
           const r0 = ROW_TABLE[l0], c0 = COL_TABLE[l0];
           const r1 = ROW_TABLE[l1], c1 = COL_TABLE[l1];
@@ -1253,7 +1291,6 @@
               if (b1d[gIdx] !== EMPTY) continue;
               const gSim = simulateMove1D(b1d, gIdx, attacker, koIdx);
               if (!gSim || gSim.ownLibs < 2) continue;
-              // For Geta to work, whichever liberty (l0 or l1) target plays next must result in `isDoomedInAtari1D`!
               let getaHolds = true;
               for (let m = 0; m < 2; m++) {
                 const escLib = directLibs[m];
@@ -1276,7 +1313,7 @@
         return -1;
       }
 
-      // Full 1D Board Chain & Semeai / Kaname-ishi / Eye-Space Analyzer
+      // Zero-Set-Allocation Ultra-Fast 1D Chain, 2nd-Order Liberties (`secondLibs`), Semeai, Kaname-ishi & Eye-Space Analyzer
       function analyzeChains1D(b1d) {
         const chainIdOf = new Int16Array(TOTAL_CELLS).fill(-1);
         const chains = [];
@@ -1287,7 +1324,10 @@
 
           const cid = chains.length;
           const stones = [];
-          const libSet = new Set();
+          const libSet = [];
+          _stampCounter = (_stampCounter + 1) & 0x3fffffff;
+          const lMark1 = _stampCounter;
+
           let qHead = 0, qTail = 0;
           _bfsQueue[qTail++] = idx;
           chainIdOf[idx] = cid;
@@ -1308,10 +1348,28 @@
               const nb = orth[i];
               const v = b1d[nb];
               if (v === EMPTY) {
-                libSet.add(nb);
+                if (_libStamp[nb] !== lMark1) {
+                  _libStamp[nb] = lMark1;
+                  libSet.push(nb);
+                }
               } else if (v === color && chainIdOf[nb] === -1) {
                 chainIdOf[nb] = cid;
                 _bfsQueue[qTail++] = nb;
+              }
+            }
+          }
+
+          // Compute 2nd-order escape liberties (`secondLibs`) using stamp marks (zero Set allocation!)
+          _stampCounter = (_stampCounter + 1) & 0x3fffffff;
+          const lMark2 = _stampCounter;
+          const secondLibSet = [];
+          for (let i = 0; i < libSet.length; i++) {
+            const orth = ORTH_TABLE[libSet[i]];
+            for (let j = 0; j < orth.length; j++) {
+              const nb = orth[j];
+              if (b1d[nb] === EMPTY && _libStamp[nb] !== lMark1 && _libStamp[nb] !== lMark2) {
+                _libStamp[nb] = lMark2;
+                secondLibSet.push(nb);
               }
             }
           }
@@ -1322,9 +1380,11 @@
             stones,
             size: stones.length,
             libSet,
-            libs: libSet.size,
+            libs: libSet.length,
+            secondLibs: secondLibSet.length,
+            secondLibSet,
             span: (maxR - minR + 1) + (maxC - minC + 1),
-            adjOppIds: new Set(),
+            adjOppIds: [],
             eyeCount: 0,
             isKaname: false
           });
@@ -1337,18 +1397,19 @@
           for (let i = 0; i < orth.length; i++) {
             const c2 = chainIdOf[orth[i]];
             if (c2 !== -1 && c2 !== c1 && chains[c1].color !== chains[c2].color) {
-              chains[c1].adjOppIds.add(c2);
-              chains[c2].adjOppIds.add(c1);
+              if (!chains[c1].adjOppIds.includes(c2)) chains[c1].adjOppIds.push(c2);
+              if (!chains[c2].adjOppIds.includes(c1)) chains[c2].adjOppIds.push(c1);
             }
           }
         }
 
         for (let i = 0; i < chains.length; i++) {
-          if (chains[i].adjOppIds.size >= 2) {
+          if (chains[i].adjOppIds.length >= 2) {
             chains[i].isKaname = true;
           }
         }
 
+        // Count single-point Eyes / Tiger's Mouths for each chain
         for (let idx = 0; idx < TOTAL_CELLS; idx++) {
           if (b1d[idx] !== EMPTY) continue;
           const orth = ORTH_TABLE[idx];
@@ -1384,118 +1445,159 @@
         return { chains, chainIdOf };
       }
 
-      // Wall-Blocked 5-Pass Wavefront Territory & Influence Diffusion (Respects stone walls, enclosures, and boundary leaks!)
+      // Wall-Blocked 6-Pass Wavefront Territory & Influence Diffusion with Reflecting Board Edges ("金角銀辺")
       const _infBufA = new Float32Array(TOTAL_CELLS);
       const _infBufB = new Float32Array(TOTAL_CELLS);
       function computeInfluence1D(b1d) {
         for (let idx = 0; idx < TOTAL_CELLS; idx++) {
           const v = b1d[idx];
-          _infBufA[idx] = v === BLACK ? 32.0 : (v === WHITE ? -32.0 : 0.0);
+          _infBufA[idx] = v === BLACK ? 36.0 : (v === WHITE ? -36.0 : 0.0);
         }
-        // 5 wavefront diffusion passes where occupied stones act as solid barriers
-        for (let pass = 0; pass < 5; pass++) {
+        for (let pass = 0; pass < 6; pass++) {
           const src = (pass & 1) === 0 ? _infBufA : _infBufB;
           const dst = (pass & 1) === 0 ? _infBufB : _infBufA;
           for (let idx = 0; idx < TOTAL_CELLS; idx++) {
             const v = b1d[idx];
             if (v !== EMPTY) {
-              dst[idx] = v === BLACK ? 32.0 : -32.0;
+              dst[idx] = v === BLACK ? 36.0 : -36.0;
               continue;
             }
             const orth = ORTH_TABLE[idx];
-            let sum = src[idx] * 0.45;
+            let nSum = 0;
             for (let i = 0; i < orth.length; i++) {
-              sum += src[orth[i]] * 0.22;
+              nSum += src[orth[i]];
             }
-            dst[idx] = sum;
+            dst[idx] = src[idx] * 0.36 + (nSum / orth.length) * 0.64;
           }
         }
-        return _infBufB;
+        return _infBufA;
       }
 
-      // High-Precision Static Board Evaluation Function (from `aiColor` perspective, when it is `nextTurnColor`'s turn)
+      // True Japanese-Rule Static Board Evaluation Function with Zobrist TT Caching & 2nd-Order Liberty Life/Death
       function evaluateBoard1D(b1d, aiColor, netCapturesByAI, nextTurnColor) {
-        const sign = aiColor === BLACK ? 1 : -1;
-        const inf = computeInfluence1D(b1d);
-        let territoryScore = 0;
-        let positionalScore = 0;
-        let stoneCount = 0;
+        const zob = computeZobrist1D(b1d);
+        const ttIdx = (zob.lo ^ (nextTurnColor || 0)) & TT_MASK;
+        let baseBlackScore = 0;
 
-        for (let idx = 0; idx < TOTAL_CELLS; idx++) {
-          const st = b1d[idx];
-          if (st !== EMPTY) stoneCount++;
-          const v = inf[idx] * sign;
-          if (v > 4.0) territoryScore += 2.2;
-          else if (v > 1.2) territoryScore += 1.0;
-          else if (v < -4.0) territoryScore -= 2.2;
-          else if (v < -1.2) territoryScore -= 1.0;
-        }
+        if (_ttHashHi[ttIdx] === zob.hi && _ttHashLo[ttIdx] === zob.lo && _ttTurn[ttIdx] === (nextTurnColor || 3)) {
+          baseBlackScore = _ttEval[ttIdx];
+        } else {
+          const inf = computeInfluence1D(b1d);
+          let territoryScore = 0; // From BLACK's perspective (+ for Black, - for White)
+          let positionalScore = 0;
+          let stoneCount = 0;
 
-        // Opening / Midgame positional line discipline
-        if (stoneCount < 120) {
           for (let idx = 0; idx < TOTAL_CELLS; idx++) {
             const st = b1d[idx];
-            if (st === EMPTY) continue;
-            const f = st === aiColor ? 1 : -1;
-            const me = MIN_EDGE_TABLE[idx];
-            if (me === 0) positionalScore += f * (-18);
-            else if (me === 2 || me === 3) positionalScore += f * 8;
-          }
-        }
-
-        const { chains } = analyzeChains1D(b1d);
-        let tacticalScore = (netCapturesByAI || 0) * 125;
-
-        for (let i = 0; i < chains.length; i++) {
-          const ch = chains[i];
-          const factor = ch.color === aiColor ? 1 : -1;
-          const sz = ch.size;
-          const kanameMult = ch.isKaname ? 1.5 : 1.0;
-
-          if (ch.libs === 1) {
-            if (nextTurnColor && nextTurnColor !== ch.color) {
-              // Opponent's turn to move: this 1-liberty chain can be captured right now!
-              tacticalScore += factor * (-118 * sz * kanameMult);
-            } else {
-              // Owner's turn to move: check if it is doomed even if it tries to escape
-              const doomed = isDoomedInAtari1D(b1d, ch.stones[0], 3);
-              tacticalScore += factor * ((doomed ? -108 : -38) * sz * kanameMult);
+            if (st !== EMPTY) {
+              stoneCount++;
+              continue; // Only empty intersections count as territory in Japanese rules!
             }
-          } else if (ch.libs === 2) {
-            if (nextTurnColor && nextTurnColor !== ch.color && findKillOn2LibGroup1D(b1d, ch.stones[0], -1, 3) !== -1) {
-              tacticalScore += factor * (-96 * sz * kanameMult);
-            } else {
-              tacticalScore += factor * (-32 * sz * kanameMult);
-            }
-          } else if (ch.libs === 3) {
-            if (ch.eyeCount < 1.5) {
-              tacticalScore += factor * (-10 * sz * kanameMult);
-            }
-          } else {
-            tacticalScore += factor * (8.5 * Math.min(12, sz) + Math.min(24, ch.libs * 2.0));
+            const v = inf[idx];
+            if (v > 5.5) territoryScore += 3.3;
+            else if (v > 1.8) territoryScore += 1.5;
+            else if (v > 0.5) territoryScore += 0.45;
+            else if (v < -5.5) territoryScore -= 3.3;
+            else if (v < -1.8) territoryScore -= 1.5;
+            else if (v < -0.5) territoryScore -= 0.45;
           }
 
-          if (sz >= 4 && ch.eyeCount >= 1.8) {
-            tacticalScore += factor * (32 + sz * 4.0);
-          }
+          if (stoneCount < 140) {
+            for (let idx = 0; idx < TOTAL_CELLS; idx++) {
+              const st = b1d[idx];
+              if (st === EMPTY) continue;
+              const f = st === BLACK ? 1 : -1;
+              const me = MIN_EDGE_TABLE[idx];
+              if (me === 0) positionalScore += f * (-18);
+              else if (me === 2 || me === 3) positionalScore += f * 7;
 
-          // Semeai (Mutual Liberty Race) Dominance
-          if (ch.libs <= 4) {
-            ch.adjOppIds.forEach(oppId => {
-              const oppCh = chains[oppId];
-              if (oppCh.libs < ch.libs) {
-                tacticalScore += factor * (36 * oppCh.size);
-              } else if (oppCh.libs === ch.libs && oppCh.libs <= 3 && nextTurnColor === ch.color) {
-                tacticalScore += factor * (20 * oppCh.size);
+              const orth = ORTH_TABLE[idx];
+              let sameOrth = 0;
+              for (let i = 0; i < orth.length; i++) {
+                if (b1d[orth[i]] === st) sameOrth++;
               }
-            });
+              if (sameOrth >= 3) positionalScore += f * (-18);
+            }
           }
+
+          const { chains } = analyzeChains1D(b1d);
+          let groupScore = 0;
+
+          for (let i = 0; i < chains.length; i++) {
+            const ch = chains[i];
+            const factor = ch.color === BLACK ? 1 : -1;
+            const sz = ch.size;
+            const kanameMult = ch.isKaname ? 1.55 : 1.0;
+
+            // Count how many of `ch`'s liberties are inside friendly wavefront territory (`inf[lk] * factor >= 4.0`)
+            let secureLibs = 0;
+            for (let k = 0; k < ch.libSet.length; k++) {
+              if (inf[ch.libSet[k]] * factor >= 4.0) secureLibs++;
+            }
+            ch.secureLibs = secureLibs;
+            const isAliveWithBase = (secureLibs >= 3) || (ch.eyeCount >= 1.8);
+
+            if (ch.libs === 1) {
+              if (nextTurnColor && nextTurnColor !== ch.color) {
+                groupScore += factor * (-135 * sz * kanameMult);
+              } else {
+                const doomed = isDoomedInAtari1D(b1d, ch.stones[0], 3);
+                groupScore += factor * ((doomed ? -125 : -45) * sz * kanameMult);
+              }
+            } else if (ch.libs === 2) {
+              if (nextTurnColor && nextTurnColor !== ch.color && findKillOn2LibGroup1D(b1d, ch.stones[0], -1, 3) !== -1) {
+                groupScore += factor * (-110 * sz * kanameMult);
+              } else {
+                groupScore += factor * (-42 * sz * kanameMult);
+              }
+            } else if (ch.libs === 3) {
+              if (!isAliveWithBase) {
+                const trapMult = (secureLibs === 0 && ch.secondLibs <= 2) ? 1.85 : 1.0;
+                groupScore += factor * (-16 * sz * kanameMult * trapMult);
+              } else {
+                groupScore += factor * 10;
+              }
+            } else {
+              // libs >= 4: check if it is completely surrounded in enemy influence (`secureLibs === 0 && secondLibs <= 2`)
+              if (sz >= 3 && !isAliveWithBase && secureLibs === 0 && ch.secondLibs <= 2) {
+                groupScore += factor * (-20 * sz * kanameMult);
+              } else {
+                groupScore += factor * (14 + Math.min(20, (ch.libs - 3) * 2.5));
+              }
+              if (sz >= 5 && ch.span < sz) {
+                groupScore += factor * (-10.5 * (sz - ch.span));
+              }
+            }
+
+            if (sz >= 4 && isAliveWithBase) {
+              groupScore += factor * 24;
+            }
+
+            // Semeai (Mutual Liberty Race) Dominance between groups without secure bases
+            if (ch.libs <= 4) {
+              for (let a = 0; a < ch.adjOppIds.length; a++) {
+                const oppCh = chains[ch.adjOppIds[a]];
+                if (oppCh.libs < ch.libs) {
+                  groupScore += factor * (40 * oppCh.size);
+                } else if (oppCh.libs === ch.libs && oppCh.libs <= 3 && nextTurnColor === ch.color) {
+                  groupScore += factor * (22 * oppCh.size);
+                }
+              }
+            }
+          }
+
+          baseBlackScore = territoryScore + positionalScore + groupScore;
+          _ttHashHi[ttIdx] = zob.hi;
+          _ttHashLo[ttIdx] = zob.lo;
+          _ttTurn[ttIdx] = nextTurnColor || 3;
+          _ttEval[ttIdx] = baseBlackScore;
         }
 
-        return territoryScore + positionalScore + tacticalScore;
+        const aiSign = aiColor === BLACK ? 1 : -1;
+        return baseBlackScore * aiSign + (netCapturesByAI || 0) * 140;
       }
 
-      // Check Empty Triangle (空き三角) and 2x2 Clump (団子石) on 1D Board
+      // Check Empty Triangle (空き三角), 2x2 Clump (団子石), and Over-Solidification on 1D Board
       function evaluateBadShape1D(b1d, r, c, color) {
         let penalty = 0;
         const corners = [
@@ -1518,8 +1620,8 @@
           if (v1 === color) own++; else if (v1 === EMPTY) emp++;
           if (v2 === color) own++; else if (v2 === EMPTY) emp++;
           if (vd === color) own++; else if (vd === EMPTY) emp++;
-          if (own === 2 && emp === 1) penalty += 45; // Empty Triangle
-          if (own === 3) penalty += 80; // 2x2 Dango clump
+          if (own === 2 && emp === 1) penalty += 60; // Empty Triangle (空き三角)
+          if (own === 3) penalty += 145; // 2x2 Dango clump (団子石・凝り形)
         }
         return penalty;
       }
@@ -1549,60 +1651,87 @@
           if (getV(3, 3) === color && getV(2, 2) === opp) {
             if ((lr === 2 && lc === 3 && getV(3, 2) === EMPTY) ||
                 (lr === 3 && lc === 2 && getV(2, 3) === EMPTY)) {
-              bonus += 95;
+              bonus += 98;
             }
-            if (getV(2, 3) === color && getV(3, 2) === opp && lr === 3 && lc === 4) bonus += 90;
-            if (getV(3, 2) === color && getV(2, 3) === opp && lr === 4 && lc === 3) bonus += 90;
-            if (getV(2, 3) === color && getV(3, 4) === color && getV(2, 4) === opp && lr === 2 && lc === 5) bonus += 85;
-            if (getV(3, 2) === color && getV(4, 3) === color && getV(4, 2) === opp && lr === 5 && lc === 2) bonus += 85;
+            if (getV(2, 3) === color && getV(3, 2) === opp && lr === 3 && lc === 4 && getV(3, 4) === EMPTY) bonus += 92;
+            if (getV(3, 2) === color && getV(2, 3) === opp && lr === 4 && lc === 3 && getV(4, 3) === EMPTY) bonus += 92;
           }
 
           if (getV(3, 3) === color && getV(2, 2) === EMPTY) {
             if (getV(2, 5) === opp && getV(5, 2) === EMPTY) {
-              if ((lr === 5 && lc === 2) || (lr === 4 && lc === 2) || (lr === 2 && lc === 3)) bonus += 60;
+              if ((lr === 5 && lc === 2) || (lr === 4 && lc === 2) || (lr === 2 && lc === 3)) bonus += 68;
             }
             if (getV(5, 2) === opp && getV(2, 5) === EMPTY) {
-              if ((lr === 2 && lc === 5) || (lr === 2 && lc === 4) || (lr === 3 && lc === 2)) bonus += 60;
+              if ((lr === 2 && lc === 5) || (lr === 2 && lc === 4) || (lr === 3 && lc === 2)) bonus += 68;
             }
           }
 
-          if (getV(3, 3) === opp && getV(2, 2) === EMPTY && getV(2, 3) === EMPTY && getV(3, 2) === EMPTY) {
-            if ((lr === 2 && lc === 5 && getV(2, 5) === EMPTY) ||
-                (lr === 5 && lc === 2 && getV(5, 2) === EMPTY)) {
-              bonus += 52;
-            } else if (lr === 2 && lc === 2 && getV(2, 5) === opp && getV(5, 2) === opp) {
-              bonus += 75;
+          // Invading or Approaching opponent's 4-4 Star stone, PLUS complete 3-3 Invasion Living Joseki!
+          if (getV(3, 3) === opp) {
+            if (getV(2, 2) === EMPTY && getV(2, 3) === EMPTY && getV(3, 2) === EMPTY) {
+              if ((lr === 2 && lc === 5 && getV(2, 5) === EMPTY) ||
+                  (lr === 5 && lc === 2 && getV(5, 2) === EMPTY)) {
+                bonus += 62;
+              } else if (lr === 2 && lc === 2 && getV(1, 2) === EMPTY && getV(2, 1) === EMPTY) {
+                bonus += 66; // Crisp San-san (3-3) invasion!
+              }
+            } else if (getV(2, 2) === color) {
+              // Follow-up Joseki after we invaded at (2,2): crawl/extend along the open side to live cleanly!
+              if (getV(2, 3) === opp && getV(3, 2) === EMPTY && lr === 3 && lc === 2) bonus += 115;
+              if (getV(3, 2) === opp && getV(2, 3) === EMPTY && lr === 2 && lc === 3) bonus += 115;
+              if (getV(2, 3) === opp && getV(3, 2) === color && getV(3, 4) === opp && lr === 4 && lc === 2 && getV(4, 2) === EMPTY) bonus += 110;
+              if (getV(3, 2) === opp && getV(2, 3) === color && getV(4, 3) === opp && lr === 2 && lc === 4 && getV(2, 4) === EMPTY) bonus += 110;
+              if (getV(2, 3) === opp && getV(3, 2) === color && lr === 1 && lc === 3 && getV(1, 3) === EMPTY) bonus += 95;
+              if (getV(3, 2) === opp && getV(2, 3) === color && lr === 3 && lc === 1 && getV(3, 1) === EMPTY) bonus += 95;
             }
           }
 
           if (getV(2, 3) === opp && getV(4, 2) === EMPTY && getV(5, 2) === EMPTY) {
-            if ((lr === 4 && lc === 2) || (lr === 5 && lc === 2)) bonus += 50;
+            if ((lr === 4 && lc === 2) || (lr === 5 && lc === 2)) bonus += 60;
           }
           if (getV(3, 2) === opp && getV(2, 4) === EMPTY && getV(2, 5) === EMPTY) {
-            if ((lr === 2 && lc === 4) || (lr === 2 && lc === 5)) bonus += 50;
+            if ((lr === 2 && lc === 4) || (lr === 2 && lc === 5)) bonus += 60;
           }
         }
         return bonus;
       }
 
-      // Generate & Score Candidate Moves on 1D Board (Clean, Bounded Tactical + Strategic Scale)
+      // Generate & Score Candidate Moves on 1D Board
       // `mode`: 0 = Root Full Search, 1 = Inner Tree Local+Tactical Search, 2 = Quiescence Tactical-Only Search
       function generateMoves1D(b1d, color, koIdx, level, lastMoveIdx, mode, rootLastMoveIdx) {
         const opp = color === BLACK ? WHITE : BLACK;
         const { chains, chainIdOf } = analyzeChains1D(b1d);
         const ladderDepth = level >= 13 ? 8 : (level >= 9 ? 6 : (level >= 6 ? 4 : 2));
 
+        const infMap = (mode < 2 && level >= 5) ? new Float32Array(computeInfluence1D(b1d)) : null;
+        const colorSign = color === BLACK ? 1 : -1;
+
+        // Compute `secureLibs` for each chain using `infMap` so we know which chains have a living territory base vs floating!
+        for (let i = 0; i < chains.length; i++) {
+          const ch = chains[i];
+          const f = ch.color === BLACK ? 1 : -1;
+          let sec = 0;
+          if (infMap) {
+            for (let k = 0; k < ch.libSet.length; k++) {
+              if (infMap[ch.libSet[k]] * f >= 4.0) sec++;
+            }
+          }
+          ch.secureLibs = sec;
+          ch.isAlive = (sec >= 3) || (ch.eyeCount >= 1.8) || (ch.libs >= 5);
+        }
+
         const save1LibMap = new Map();
         const save2LibMap = new Map();
         const dragonEscapeLibMap = new Map();
         const provenKillMoveMap = new Map();
         const semeaiAttackLibMap = new Map();
+        const surroundNetMap = new Map();
         const eyeVitalPointMap = new Map();
         const tacticalSet = new Set();
 
         for (let i = 0; i < chains.length; i++) {
           const ch = chains[i];
-          const kMult = ch.isKaname ? 1.4 : 1.0;
+          const kMult = ch.isKaname ? 1.5 : 1.0;
 
           if (ch.color === color) {
             if (ch.libs === 1) {
@@ -1610,12 +1739,11 @@
                 save1LibMap.set(lk, (save1LibMap.get(lk) || 0) + ch.size * kMult);
                 tacticalSet.add(lk);
               });
-              // ONLY counter-attack an adjacent enemy chain if it ALSO has 1 liberty (immediate capture saves our 1-lib chain!)
               ch.adjOppIds.forEach(oppId => {
                 const og = chains[oppId];
                 if (og.libs === 1) {
                   og.libSet.forEach(olk => {
-                    provenKillMoveMap.set(olk, Math.max(provenKillMoveMap.get(olk) || 0, 260 + (ch.size + og.size) * 65));
+                    provenKillMoveMap.set(olk, Math.max(provenKillMoveMap.get(olk) || 0, 270 + (ch.size + og.size) * 70));
                     tacticalSet.add(olk);
                   });
                 }
@@ -1634,38 +1762,43 @@
               if (killThreatIdx !== -1 && b1d[killThreatIdx] === EMPTY) {
                 save2LibMap.set(killThreatIdx, {
                   repStone: ch.stones[0],
-                  weight: ch.size * kMult * 1.2,
+                  weight: ch.size * kMult * 1.25,
                   inDanger: true
                 });
                 tacticalSet.add(killThreatIdx);
               }
-              // If adjacent enemy group has <= 2 liberties, attacking it is a valid Semeai option
               ch.adjOppIds.forEach(oppId => {
                 const og = chains[oppId];
                 if (og.libs === 1) {
                   og.libSet.forEach(olk => {
-                    provenKillMoveMap.set(olk, Math.max(provenKillMoveMap.get(olk) || 0, 240 + (ch.size + og.size) * 55));
+                    provenKillMoveMap.set(olk, Math.max(provenKillMoveMap.get(olk) || 0, 250 + (ch.size + og.size) * 60));
                     tacticalSet.add(olk);
                   });
                 } else if (og.libs === 2) {
                   og.libSet.forEach(olk => {
-                    semeaiAttackLibMap.set(olk, Math.max(semeaiAttackLibMap.get(olk) || 0, 85 + (ch.size + og.size) * 25));
+                    semeaiAttackLibMap.set(olk, Math.max(semeaiAttackLibMap.get(olk) || 0, 95 + (ch.size + og.size) * 28));
                     tacticalSet.add(olk);
                   });
                 }
               });
-            } else if ((ch.libs === 3 || ch.libs === 4) && level >= 7) {
-              if (ch.isKaname || (ch.size >= 2 && ch.eyeCount < 1.5)) {
-                const urg = (ch.libs === 3 ? 55 : 28) * Math.min(6, ch.size) * kMult;
+            } else if ((ch.libs === 3 || (ch.libs === 4 && ch.secondLibs <= 3)) && level >= 7 && mode < 2) {
+              if (ch.isKaname || (ch.size >= 2 && !ch.isAlive && ch.secureLibs <= 1)) {
+                const urg = (ch.libs === 3 ? 58 : 38) * Math.min(6, ch.size) * kMult;
                 ch.libSet.forEach(lk => {
                   dragonEscapeLibMap.set(lk, Math.max(dragonEscapeLibMap.get(lk) || 0, urg));
                   tacticalSet.add(lk);
                 });
+                if (mode === 0 && ch.secondLibs <= 3) {
+                  ch.secondLibSet.forEach(slk => {
+                    dragonEscapeLibMap.set(slk, Math.max(dragonEscapeLibMap.get(slk) || 0, urg * 0.7));
+                    tacticalSet.add(slk);
+                  });
+                }
               }
               ch.adjOppIds.forEach(oppId => {
                 const og = chains[oppId];
                 if (og.libs <= ch.libs && og.libs <= 3) {
-                  const raceBonus = (4 - og.libs) * 45 + Math.min(6, ch.size + og.size) * 15;
+                  const raceBonus = (4 - og.libs) * 48 + Math.min(6, ch.size + og.size) * 18;
                   og.libSet.forEach(olk => {
                     semeaiAttackLibMap.set(olk, Math.max(semeaiAttackLibMap.get(olk) || 0, raceBonus));
                     tacticalSet.add(olk);
@@ -1674,49 +1807,65 @@
               });
             }
           } else {
-            // Opponent chain analysis
+            // Opponent chain analysis: Hunt 1-lib, 2-lib, 3-lib, and surrounded dragons!
             if (ch.libs === 1) {
               ch.libSet.forEach(lk => {
-                provenKillMoveMap.set(lk, Math.max(provenKillMoveMap.get(lk) || 0, (220 + ch.size * 70) * kMult));
+                provenKillMoveMap.set(lk, Math.max(provenKillMoveMap.get(lk) || 0, (240 + ch.size * 75) * kMult));
                 tacticalSet.add(lk);
               });
             } else if (ch.libs === 2 && level >= 5) {
               const winningIdx = (level >= 6 && mode < 2) ? findKillOn2LibGroup1D(b1d, ch.stones[0], koIdx, ladderDepth) : -1;
               if (winningIdx !== -1) {
-                provenKillMoveMap.set(winningIdx, Math.max(provenKillMoveMap.get(winningIdx) || 0, (190 + ch.size * 65) * kMult));
+                provenKillMoveMap.set(winningIdx, Math.max(provenKillMoveMap.get(winningIdx) || 0, (205 + ch.size * 70) * kMult));
                 tacticalSet.add(winningIdx);
-              } else if (ch.isKaname || ch.size >= 3) {
+              } else if (ch.isKaname || ch.size >= 2) {
                 ch.libSet.forEach(lk => {
-                  semeaiAttackLibMap.set(lk, Math.max(semeaiAttackLibMap.get(lk) || 0, (55 + ch.size * 18) * kMult));
+                  semeaiAttackLibMap.set(lk, Math.max(semeaiAttackLibMap.get(lk) || 0, (62 + ch.size * 20) * kMult));
                   tacticalSet.add(lk);
                 });
               }
-            } else if (ch.libs === 3 && level >= 8 && mode < 2) {
-              if (ch.isKaname || (ch.size >= 3 && ch.eyeCount < 1.5)) {
-                const huntW = 42 * Math.min(6, ch.size) * kMult;
+            } else if ((ch.libs === 3 || (ch.libs === 4 && ch.secondLibs <= 3)) && level >= 8 && mode < 2) {
+              if (ch.isKaname || (ch.size >= 2 && !ch.isAlive && ch.secureLibs <= 1)) {
+                const huntW = (ch.libs === 3 ? 52 : 34) * Math.min(6, ch.size) * kMult;
                 ch.libSet.forEach(lk => {
                   semeaiAttackLibMap.set(lk, Math.max(semeaiAttackLibMap.get(lk) || 0, huntW));
                   tacticalSet.add(lk);
                 });
+                if (mode === 0 && ch.secondLibs <= 3) {
+                  ch.secondLibSet.forEach(slk => {
+                    surroundNetMap.set(slk, Math.max(surroundNetMap.get(slk) || 0, huntW * 0.8));
+                    tacticalSet.add(slk);
+                  });
+                }
               }
             }
           }
         }
 
+        // Vital Eye Point (眼形の急所・中手) detector for surrounded groups
         if (level >= 9 && mode < 2) {
           for (let idx = 0; idx < TOTAL_CELLS; idx++) {
             if (b1d[idx] !== EMPTY) continue;
             const orth = ORTH_TABLE[idx];
             let ownOrth = 0, oppOrth = 0;
+            let weakChainNear = false;
             for (let i = 0; i < orth.length; i++) {
               const v = b1d[orth[i]];
               if (v === color) ownOrth++;
               else if (v === opp) oppOrth++;
+              const cid = chainIdOf[orth[i]];
+              if (cid !== -1 && (chains[cid].libs <= 4 || chains[cid].secondLibs <= 3) && chains[cid].eyeCount < 1.8) {
+                weakChainNear = true;
+              }
             }
-            if (ownOrth === orth.length - 1 && oppOrth === 0) {
-              eyeVitalPointMap.set(idx, 45);
-            } else if (oppOrth === orth.length - 1 && ownOrth === 0) {
-              eyeVitalPointMap.set(idx, 52);
+            if (weakChainNear) {
+              if (ownOrth === orth.length - 1 && oppOrth === 0) {
+                eyeVitalPointMap.set(idx, 68);
+                tacticalSet.add(idx);
+              } else if (oppOrth === orth.length - 1 && ownOrth === 0) {
+                eyeVitalPointMap.set(idx, 76); // Nakade / Eye-stealing vital point!
+                tacticalSet.add(idx);
+              }
             }
           }
         }
@@ -1728,18 +1877,15 @@
         }
 
         if (mode === 0) {
-          STAR_POINTS.forEach(([sr, sc]) => candidateSet.add(sr * BOARD_SIZE + sc));
-          const keyOpenings = [
-            [2, 3], [3, 2], [2, 15], [3, 16],
-            [15, 2], [16, 3], [15, 16], [16, 15],
-            [2, 2], [2, 16], [16, 2], [16, 16],
-            [2, 5], [5, 2], [2, 13], [5, 16],
-            [13, 2], [16, 5], [13, 16], [16, 13],
-            [4, 2], [2, 4], [4, 16], [2, 14],
-            [14, 2], [16, 4], [14, 16], [16, 14],
-            [2, 9], [9, 2], [9, 16], [16, 9]
-          ];
-          keyOpenings.forEach(([kr, kc]) => candidateSet.add(kr * BOARD_SIZE + kc));
+          for (let r = 2; r <= 16; r++) {
+            for (let c = 2; c <= 16; c++) {
+              const me = Math.min(r, 18 - r, c, 18 - c);
+              if (me === 2 || me === 3 || ((r === 9 || c === 9) && (r % 3 === 0 && c % 3 === 0))) {
+                const idx = r * BOARD_SIZE + c;
+                if (b1d[idx] === EMPTY) candidateSet.add(idx);
+              }
+            }
+          }
 
           const radTable = level >= 7 ? RAD3_TABLE : RAD2_TABLE;
           for (let idx = 0; idx < TOTAL_CELLS; idx++) {
@@ -1776,18 +1922,21 @@
           }
         }
 
-        const infMap = (mode === 0 && level >= 5) ? new Float32Array(computeInfluence1D(b1d)) : null;
-        const colorSign = color === BLACK ? 1 : -1;
 
-        let lastMoveIsContactFight = false;
+
+        let lastMoveIsUrgentFight = false;
         if (lastMoveIdx >= 0 && lastMoveIdx < TOTAL_CELLS) {
+          const lastChainId = chainIdOf[lastMoveIdx];
+          if (lastChainId !== -1 && (chains[lastChainId].libs <= 3 || chains[lastChainId].secondLibs <= 2)) {
+            lastMoveIsUrgentFight = true;
+          }
           const rad2 = RAD2_TABLE[lastMoveIdx];
           for (let i = 0; i < rad2.length; i++) {
             const nb = rad2[i];
             if (b1d[nb] === color) {
               const cid = chainIdOf[nb];
-              if (cid !== -1 && (chains[cid].libs <= 4 || ORTH_TABLE[lastMoveIdx].includes(nb) || DIAG_TABLE[lastMoveIdx].includes(nb))) {
-                lastMoveIsContactFight = true;
+              if (cid !== -1 && (chains[cid].libs <= 4 || chains[cid].secondLibs <= 2)) {
+                lastMoveIsUrgentFight = true;
                 break;
               }
             }
@@ -1802,7 +1951,6 @@
           if (!sim) return;
 
           const orth = ORTH_TABLE[idx];
-          // Only skip filling a true single-chain eye that already belongs to a single connected chain with >= 2 liberties
           let isSingleChainTrueEye = true;
           const firstOrthCid = chainIdOf[orth[0]];
           for (let i = 0; i < orth.length; i++) {
@@ -1816,25 +1964,55 @@
           const r = ROW_TABLE[idx], c = COL_TABLE[idx];
           let score = 0;
 
-          // 1. Direct Capture & Proven Kill
+          const adjOwnCids = new Set();
+          const adjOppCids = new Set();
+          let minAdjOwnLibsBefore = 99;
+          let minAdjOppLibsBefore = 99;
+          let orthOwnCount = 0;
+          let orthOppCount = 0;
+
+          for (let i = 0; i < orth.length; i++) {
+            const nb = orth[i];
+            const cid = chainIdOf[nb];
+            if (cid !== -1) {
+              const ch = chains[cid];
+              if (b1d[nb] === color) {
+                orthOwnCount++;
+                adjOwnCids.add(cid);
+                if (ch.libs < minAdjOwnLibsBefore) minAdjOwnLibsBefore = ch.libs;
+              } else if (b1d[nb] === opp) {
+                orthOppCount++;
+                adjOppCids.add(cid);
+                if (ch.libs < minAdjOppLibsBefore) minAdjOppLibsBefore = ch.libs;
+              }
+            }
+          }
+
+          // 1. Direct Capture, Proven Kill, Semeai, & Surrounding Net
           if (sim.capturedCount > 0) {
-            score += (240 + level * 5) * sim.capturedCount;
+            score += (260 + level * 5) * sim.capturedCount;
           } else if (provenKillMoveMap.has(idx)) {
             score += provenKillMoveMap.get(idx);
           } else if (semeaiAttackLibMap.has(idx)) {
             score += semeaiAttackLibMap.get(idx);
+          }
+          if (surroundNetMap.has(idx) && sim.ownLibs >= 3) {
+            score += surroundNetMap.get(idx);
+          }
+          if (eyeVitalPointMap.has(idx)) {
+            score += eyeVitalPointMap.get(idx);
           }
 
           // 2. Saving Own Chain in Atari (1 liberty)
           if (save1LibMap.has(idx)) {
             const savedW = save1LibMap.get(idx);
             if (sim.ownLibs >= 3) {
-              score += 250 * savedW;
+              score += 270 * savedW;
             } else if (sim.ownLibs === 2) {
               const canOppKill = (level >= 6 && mode < 2) ? (findKillOn2LibGroup1D(sim.nextB, idx, sim.nextKo, ladderDepth) !== -1) : false;
-              score += canOppKill ? (-200 * savedW) : (200 * savedW);
+              score += canOppKill ? (-220 * savedW) : (215 * savedW);
             } else {
-              score -= 200 * savedW;
+              score -= 220 * savedW;
             }
           }
 
@@ -1843,21 +2021,21 @@
             const info = save2LibMap.get(idx);
             const afterOwnInfo = getChainInfo1D(sim.nextB, info.repStone);
             if (afterOwnInfo.libs >= 3) {
-              score += (info.inDanger ? 185 : 65) * info.weight;
+              score += (info.inDanger ? 195 : 72) * info.weight;
             } else if (afterOwnInfo.libs === 2 && info.inDanger && mode < 2) {
               const stillKilled = level >= 6 ? (findKillOn2LibGroup1D(sim.nextB, info.repStone, sim.nextKo, ladderDepth) !== -1) : false;
-              score += stillKilled ? (-95 * info.weight) : (125 * info.weight);
+              score += stillKilled ? (-105 * info.weight) : (135 * info.weight);
             }
           }
 
-          // 4. Dragon Survival & Anti-Surround Expansion
+          // 4. Dragon Survival & Breakout Expansion
           if (dragonEscapeLibMap.has(idx)) {
             const dBonus = dragonEscapeLibMap.get(idx);
-            if (sim.ownLibs >= 4) score += dBonus * 1.2;
-            else if (sim.ownLibs >= 3) score += dBonus * 0.8;
+            if (sim.ownLibs >= 4) score += dBonus * 1.3;
+            else if (sim.ownLibs >= 3) score += dBonus * 0.9;
           }
 
-          // 5. Self-Atari & Turn-Aware Ladder Safety Check
+          // 5. Self-Atari, Ladder Safety, AND Strict Anti-Over-Solidification (固めすぎ防止)
           if (sim.ownLibs === 1) {
             let isThrowIn = false;
             if (sim.ownSize === 1 && level >= 8) {
@@ -1869,15 +2047,19 @@
                 }
               }
             }
-            score += isThrowIn ? 75 : (-280 * sim.ownSize);
+            score += isThrowIn ? 80 : (-300 * sim.ownSize);
           } else if (sim.ownLibs === 2) {
             if (level >= 6 && mode < 2 && findKillOn2LibGroup1D(sim.nextB, idx, sim.nextKo, ladderDepth) !== -1) {
-              score -= 220 * sim.ownSize;
-            } else {
-              score += 5;
+              score -= 240 * sim.ownSize;
             }
           } else if (sim.ownLibs >= 3) {
-            score += 18 + Math.min(20, sim.ownLibs * 2.5);
+            if (adjOwnCids.size === 0) {
+              score += sim.ownLibs === 4 ? 24 : 14;
+            } else if (minAdjOwnLibsBefore <= 3 && sim.ownLibs > minAdjOwnLibsBefore) {
+              score += (sim.ownLibs - minAdjOwnLibsBefore) * 18;
+            } else if (minAdjOwnLibsBefore >= 5 && orthOppCount === 0 && sim.capturedCount === 0) {
+              score -= 78; // Never clump onto an already-strong chain!
+            }
           }
 
           // 6. Attacking Adjacent Opponent Chains: Double-Atari (両アタリ), Doomed Atari
@@ -1894,58 +2076,65 @@
               checkedOpp.add(repStone);
 
               const origCid = chainIdOf[nb];
-              const isKanameTarget = (origCid !== -1 && chains[origCid].isKaname) ? 1.5 : 1.0;
+              const isKanameTarget = (origCid !== -1 && chains[origCid].isKaname) ? 1.55 : 1.0;
 
               if (oppInfo.libs === 1) {
                 atariCount++;
                 const doomed = level >= 6 ? isDoomedInAtari1D(sim.nextB, nb, ladderDepth) : true;
                 if (doomed) {
-                  score += (195 + oppInfo.size * 70) * isKanameTarget;
+                  score += (215 + oppInfo.size * 75) * isKanameTarget;
                 } else {
-                  score += (18 + oppInfo.size * 4) * isKanameTarget;
+                  score += (16 + oppInfo.size * 4) * isKanameTarget;
                 }
               } else if (oppInfo.libs === 2 && sim.ownLibs >= 3) {
-                score += (30 + oppInfo.size * 10) * isKanameTarget;
+                score += (35 + oppInfo.size * 11) * isKanameTarget;
               }
             }
           }
           if (atariCount >= 2 && sim.ownLibs >= 2) {
-            score += 290;
+            score += 310;
           }
 
-          // 7. Connections (ツギ), Safe Cuts (切り), Local Proverbs (ツケハネ・二子の頭)
+          // 7. Smart Connections (ツギ), Safe Cuts (切り), Hane at Head of Two Stones (二子の頭にハネよ), & Anti-Clumping
           if (mode < 2 && level >= 5) {
-            if (eyeVitalPointMap.has(idx)) {
-              score += eyeVitalPointMap.get(idx);
-            }
-
-            const adjOwnCids = new Set();
-            const adjOppCids = new Set();
-            for (let i = 0; i < orth.length; i++) {
-              const nb = orth[i];
-              const cid = chainIdOf[nb];
-              if (cid !== -1) {
-                if (b1d[nb] === color) adjOwnCids.add(cid);
-                else if (b1d[nb] === opp) adjOppCids.add(cid);
+            if (adjOwnCids.size >= 2 && sim.ownLibs >= 2) {
+              if (minAdjOwnLibsBefore <= 3) {
+                let weakBonus = 0;
+                adjOwnCids.forEach(cid => {
+                  if (chains[cid].libs <= 3) weakBonus += chains[cid].size * 30;
+                });
+                score += 80 + weakBonus;
+              } else if (minAdjOwnLibsBefore === 4) {
+                score += 34;
+              } else {
+                score -= 52;
               }
             }
 
-            // Connecting 2+ own groups
-            if (adjOwnCids.size >= 2 && sim.ownLibs >= 2) {
-              let weakBonus = 0;
-              adjOwnCids.forEach(cid => {
-                if (chains[cid].libs <= 3) weakBonus += chains[cid].size * 28;
-              });
-              score += 65 * adjOwnCids.size + weakBonus;
-            }
-
-            // Cutting 2+ opponent groups: ONLY reward if our stone has >= 3 liberties OR puts an enemy group into Atari!
-            // If our single cutting stone only has 2 liberties while enemy groups have >= 2 liberties, penalize reckless self-wedge!
             if (adjOppCids.size >= 2) {
               if (sim.ownLibs >= 3 || minAdjOppLibsAfter === 1) {
-                score += 75 * adjOppCids.size;
+                score += 82 * adjOppCids.size;
               } else if (sim.ownLibs === 2 && sim.ownSize === 1 && minAdjOppLibsAfter >= 2) {
-                score -= 85; // Do NOT wedge a single 2-liberty stone into opponent's Tiger's Mouth!
+                score -= 95;
+              }
+            }
+
+            // "Hane at the Head of Two Stones" (二子の頭にハネよ) detector
+            const dirs4 = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+            for (let d = 0; d < 4; d++) {
+              const [dr, dc] = dirs4[d];
+              const r1 = r + dr, c1 = c + dc;
+              const r2 = r + dr * 2, c2 = c + dc * 2;
+              if (r2 >= 0 && r2 < BOARD_SIZE && c2 >= 0 && c2 < BOARD_SIZE) {
+                if (b1d[r1 * BOARD_SIZE + c1] === opp && b1d[r2 * BOARD_SIZE + c2] === opp && sim.ownLibs >= 3) {
+                  // Check if we have a supporting stone alongside the opponent's 2 stones
+                  const p1r = r1 - dc, p1c = c1 + dr;
+                  const p2r = r1 + dc, p2c = c1 - dr;
+                  if ((p1r >= 0 && p1r < BOARD_SIZE && p1c >= 0 && p1c < BOARD_SIZE && b1d[p1r * BOARD_SIZE + p1c] === color) ||
+                      (p2r >= 0 && p2r < BOARD_SIZE && p2c >= 0 && p2c < BOARD_SIZE && b1d[p2r * BOARD_SIZE + p2c] === color)) {
+                    score += 74; // Crisp Hane at the Head of Two Stones!
+                  }
+                }
               }
             }
 
@@ -1968,20 +2157,23 @@
               const v1 = b1d[idx1], v2 = b1d[idx2], vd = b1d[idxd];
 
               if (v1 === color && v2 === color && chainIdOf[idx1] !== chainIdOf[idx2] && vd === opp && sim.ownLibs >= 2) {
-                score += 125; // Defend Peep / Diagonal Cut!
+                const c1Libs = chains[chainIdOf[idx1]].libs;
+                const c2Libs = chains[chainIdOf[idx2]].libs;
+                if (Math.min(c1Libs, c2Libs) <= 4) {
+                  score += 115;
+                }
               }
               if (v1 === opp && v2 === opp && chainIdOf[idx1] !== chainIdOf[idx2] && vd === color && sim.ownLibs >= 3) {
-                score += 85; // Safe Diagonal Cut with >= 3 liberties!
+                score += 86;
               }
               if (v1 === color && v2 === opp && vd === opp && sim.ownLibs >= 3) {
-                score += 55; // Hane at head of stones / Osae!
-              }
-              if (v1 === color && v2 === opp && vd === color && sim.ownLibs >= 3) {
-                score += 48; // Crisp Hane!
+                if (minAdjOwnLibsBefore <= 4 || minAdjOppLibsBefore <= 4) {
+                  score += 50;
+                }
               }
             }
 
-            if (sim.capturedCount === 0 && adjOwnCids.size < 2) {
+            if (sim.capturedCount === 0 && !save1LibMap.has(idx)) {
               score -= evaluateBadShape1D(b1d, r, c, color);
             }
           }
@@ -1997,66 +2189,97 @@
             if (v === color) ownNearR2++;
             else if (v === opp) oppNearR2++;
           }
+          let ownNearR3 = 0, oppNearR3 = 0;
+          const rad3List = RAD3_TABLE[idx];
+          for (let i = 0; i < rad3List.length; i++) {
+            const v = b1d[rad3List[i]];
+            if (v === color) ownNearR3++;
+            else if (v === opp) oppNearR3++;
+          }
 
+          let diagOwnCount = 0, diagOppCount = 0;
+          const diagList = DIAG_TABLE[idx];
+          for (let i = 0; i < diagList.length; i++) {
+            const dv = b1d[diagList[i]];
+            if (dv === color) diagOwnCount++;
+            else if (dv === opp) diagOppCount++;
+          }
+
+          // 8. Global Big Points (大場・二間ビラキ・ケイマ), 1st/2nd Line Yose Sealing, & Moyo Expansion
+          const minEdge = MIN_EDGE_TABLE[idx];
           if (mode < 2) {
-            const minEdge = MIN_EDGE_TABLE[idx];
             if (minEdge === 0) {
-              let orthOwn = 0, orthOpp = 0;
-              for (let i = 0; i < orth.length; i++) {
-                if (b1d[orth[i]] === color) orthOwn++;
-                else if (b1d[orth[i]] === opp) orthOpp++;
-              }
-              if (orthOwn >= 1 && orthOpp >= 1 && sim.ownLibs >= 2) {
-                score += 55;
-              } else if (oppNearR2 > 0 && ownNearR2 > 0 && stoneCount > 80) {
-                score += 12;
+              const is1stLineYose = (orthOwnCount >= 1 && (orthOppCount >= 1 || diagOppCount >= 1)) ||
+                                    (orthOppCount >= 1 && diagOwnCount >= 1);
+              if (is1stLineYose && sim.ownLibs >= 2 && stoneCount > 55) {
+                score += (stoneCount > 100 ? 82 : 50);
               } else {
-                score -= (stoneCount < 130) ? 85 : 25;
+                score -= (stoneCount < 130) ? 95 : 40;
               }
             } else if (minEdge === 1) {
-              if (ownNearR2 >= 1 && oppNearR2 >= 1 && sim.ownLibs >= 3) {
-                score += 42;
-              } else if (ownNearR2 === 0 && oppNearR2 === 0 && stoneCount < 80) {
-                score -= 35;
+              const is2ndLineYose = (orthOwnCount >= 1 && (orthOppCount >= 1 || diagOppCount >= 1)) ||
+                                    (orthOppCount >= 1 && diagOwnCount >= 1) ||
+                                    (ownNearR2 >= 1 && oppNearR2 >= 1 && stoneCount > 70);
+              if (is2ndLineYose && sim.ownLibs >= 3 && stoneCount > 40) {
+                score += (stoneCount > 90 ? 66 : 42);
+              } else if (stoneCount < 90 && ownNearR2 === 0 && oppNearR2 === 0) {
+                score -= 42;
               }
-            } else if (minEdge === 2 || minEdge === 3) {
-              score += (stoneCount < 105 ? 28 : 12);
-              if (mode === 0 && stoneCount < 90 && level >= 6 && ownNearR2 === 0 && oppNearR2 === 0) {
-                score += 42;
+            } else if (minEdge === 2 || minEdge === 3 || minEdge === 4) {
+              if (minEdge === 2 || minEdge === 3) {
+                score += (stoneCount < 110 ? 30 : 14);
+              }
+
+              if (ownNearR2 === 0 && oppNearR2 === 0 && (minEdge === 2 || minEdge === 3)) {
+                score += 70;
+                if (ownNearR3 >= 1 && ownNearR3 <= 3) {
+                  score += 28;
+                }
+              } else if (orthOwnCount === 0 && orthOppCount === 0 && ownNearR2 >= 1 && ownNearR2 <= 2 && oppNearR2 <= 2 && sim.ownLibs === 4) {
+                score += 44;
               }
             }
 
-            if (stoneCount < 40 && (r === 3 || r === 15) && (c === 3 || c === 15)) {
-              const rad3 = RAD3_TABLE[idx];
-              let cornerEmpty = true;
-              for (let i = 0; i < rad3.length; i++) {
-                if (b1d[rad3[i]] !== EMPTY) { cornerEmpty = false; break; }
-              }
-              if (cornerEmpty) score += 75;
+            if (stoneCount < 45 && (r === 3 || r === 15) && (c === 3 || c === 15)) {
+              if (ownNearR3 === 0 && oppNearR3 === 0) score += 88;
             }
           }
 
+          // 9. Wavefront Territory Control, Yose Boundary Gradient (境界の急所), & Invasion of Opponent Moyo
           if (infMap) {
             const localInf = infMap[idx] * colorSign;
-            if (oppNearR2 > 0 && localInf > 3.5) {
-              score += 58 + Math.min(35, localInf * 2.0);
-            } else if (Math.abs(localInf) <= 6.5) {
-              score += 30 - Math.abs(localInf) * 2.2;
-            } else if (localInf > 10.0 && oppNearR2 === 0 && sim.capturedCount === 0) {
-              score -= 95;
-            } else if (localInf < -12.0 && sim.ownLibs < 3 && ownNearR2 === 0) {
-              score -= 65;
+
+            // Compute Wavefront Gradient across orthogonal neighbors (identifies exact Yose / Frontier boundary!)
+            let maxNInf = -99, minNInf = 99;
+            for (let i = 0; i < orth.length; i++) {
+              const ni = infMap[orth[i]];
+              if (ni > maxNInf) maxNInf = ni;
+              if (ni < minNInf) minNInf = ni;
+            }
+            if (maxNInf > 1.5 && minNInf < -1.5 && sim.ownLibs >= 2) {
+              // Exact contested frontier between Black and White!
+              const grad = Math.min(48, (maxNInf - minNInf) * 1.15);
+              score += grad;
+            }
+
+            if (oppNearR2 > 0 && localInf > 3.5 && minAdjOwnLibsBefore <= 4) {
+              score += 60 + Math.min(30, localInf * 1.8);
+            } else if (localInf <= -3.5 && localInf >= -24.0 && minEdge >= 2 && oppNearR2 <= 2 && orthOppCount === 0 && sim.ownLibs === 4) {
+              score += 80 + Math.min(34, Math.abs(localInf) * 1.5);
+            } else if (Math.abs(localInf) <= 6.5 && orthOwnCount === 0) {
+              score += 36 - Math.abs(localInf) * 2.5;
+            } else if (localInf > 7.5 && oppNearR2 === 0 && sim.capturedCount === 0) {
+              score -= 125;
             }
           }
 
+          // 10. Conditional Local Response
           if (lastMoveIdx >= 0 && lastMoveIdx < TOTAL_CELLS && level >= 4) {
             const distLast = Math.abs(r - ROW_TABLE[lastMoveIdx]) + Math.abs(c - COL_TABLE[lastMoveIdx]);
-            if (lastMoveIsContactFight && sim.ownLibs >= 3) {
-              if (distLast === 1) score += 55;
+            if (lastMoveIsUrgentFight && sim.ownLibs >= 3) {
+              if (distLast === 1) score += 48;
               else if (distLast === 2) score += 40;
-              else if (distLast === 3) score += 20;
-            } else if (distLast === 2 || distLast === 3) {
-              score += 14;
+              else if (distLast === 3) score += 22;
             }
           }
 
@@ -2231,7 +2454,7 @@
         }
 
         // Lv.6 to Lv.15: Deep Alpha-Beta Minimax + Quiescence Search
-        const timeBudgetMs = level <= 8 ? 100 : (level <= 11 ? 180 : (level <= 13 ? 280 : 440));
+        const timeBudgetMs = level <= 8 ? 100 : (level <= 11 ? 180 : (level <= 13 ? 280 : 450));
         const deadlineMs = Date.now() + timeBudgetMs;
         const depthSteps = level <= 10 ? [1] : [1, 3];
         const rootBeam = level <= 8 ? 6 : (level <= 11 ? 8 : (level <= 13 ? 10 : 12));
@@ -2270,7 +2493,6 @@
               lastMvIdx
             );
 
-            // Alpha-Beta board evaluation `searchVal` is the primary decision driver; `mv.score` is a clean prior tie-breaker!
             const combinedScore = searchVal + mv.score * 0.16;
             mv.lastSearchScore = combinedScore;
             if (combinedScore > currentBestScore) {
@@ -2653,8 +2875,8 @@
         // Role labels (Show current AI Rank out of 7 levels)
         const rankLabel = (AI_RANKS[aiLevel] && AI_RANKS[aiLevel].short) ? AI_RANKS[aiLevel].short : `Lv.${aiLevel}`;
         if (gameMode === 'ai') {
-          document.getElementById('blackRoleTag').textContent = humanColor === BLACK ? '(あなた)' : `(AI・${rankLabel})`;
-          document.getElementById('whiteRoleTag').textContent = humanColor === WHITE ? '(あなた)' : `(AI・${rankLabel})`;
+          document.getElementById('blackRoleTag').textContent = humanColor === BLACK ? '(あなた)' : `(${rankLabel})`;
+          document.getElementById('whiteRoleTag').textContent = humanColor === WHITE ? '(あなた)' : `(${rankLabel})`;
         } else {
           document.getElementById('blackRoleTag').textContent = '(プレイヤー1)';
           document.getElementById('whiteRoleTag').textContent = '(プレイヤー2)';
